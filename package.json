@@ -1,0 +1,21 @@
+{
+  "name": "printkaar-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "express": "^5.1.0",
+    "express-validator": "^7.3.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.20.0",
+    "nodemailer": "^7.0.10"
+  }
+}
