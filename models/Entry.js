@@ -4,7 +4,7 @@ const { Schema } = mongoose;
 const EntrySchema = new Schema({
   type: {
     type: String,
-    enum: ["sell", "purchase", "others", "expense", "restMoney"],
+    enum: ["sell", "purchase", "others", "expense", "restMoney","delivery"],
     required: true,
   },
 
@@ -65,26 +65,26 @@ const EntrySchema = new Schema({
 
 
 // --------------------- AUTO ORDER ID GENERATOR ---------------------
-EntrySchema.pre("save", async function (next) {
-  if (this.orderId) return next();
+// EntrySchema.pre("save", async function (next) {
+//   if (this.orderId) return next();
 
-  try {
-    const lastEntry = await this.constructor.findOne().sort({ createdAt: -1 });
+//   try {
+//     const lastEntry = await this.constructor.findOne().sort({ createdAt: -1 });
 
-    let nextNumber = 1;
+//     let nextNumber = 1;
 
-    if (lastEntry && lastEntry.orderId) {
-      const num = parseInt(lastEntry.orderId.replace(/\D/g, ""), 10);
-      nextNumber = num + 1;
-    }
+//     if (lastEntry && lastEntry.orderId) {
+//       const num = parseInt(lastEntry.orderId.replace(/\D/g, ""), 10);
+//       nextNumber = num + 1;
+//     }
 
-    const padded = String(nextNumber).padStart(6, "0");
-    this.orderId = `#P${padded}K`;
+//     const padded = String(nextNumber).padStart(6, "0");
+//     this.orderId = `#P${padded}K`;
 
-    next();
-  } catch (err) {
-    next(err);
-  }
-});
+//     next();
+//   } catch (err) {
+//     next(err);
+//   }
+// });
 
 module.exports = mongoose.model("Entry", EntrySchema);

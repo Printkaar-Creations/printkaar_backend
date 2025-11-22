@@ -25,5 +25,5 @@ app.get("/", (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Sadaqah backend listening on port ${PORT}`);
+  console.log(`Printkaar backend listening on port ${PORT}`);
 });

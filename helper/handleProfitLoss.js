@@ -7,24 +7,37 @@ async function handleProfitLoss(sellId) {
 
   const sellTotal = Number(sellEntry.totalAmount || 0);
 
-  // get all purchases linked to this sell
+  // Get all purchases linked to this sell
   const purchases = await Entry.find({
     linkedSellId: sellId,
     type: "purchase",
   });
 
-  let purchaseTotal = 0;
-  purchases.forEach((p) => {
-    purchaseTotal += Number(p.totalAmount || 0);
+  let purchaseTotal = purchases.reduce(
+    (sum, p) => sum + Number(p.totalAmount || 0),
+    0
+  );
+
+  // ⭐ NEW — Get all delivery charges OWN
+  const deliveryOwnEntries = await Entry.find({
+    linkedSellId: sellId,
+    type: "delivery",
+    note: "Delivery Charge (Own)",
   });
 
-  const profitLoss = sellTotal - purchaseTotal;
+  const deliveryOwnTotal = deliveryOwnEntries.reduce(
+    (sum, d) => sum + Number(d.totalAmount || 0),
+    0
+  );
+
+  // ⭐ Calculate final profit
+  const profitLoss = sellTotal - purchaseTotal - deliveryOwnTotal;
 
   let type = "neutral";
   if (profitLoss > 0) type = "profit";
   if (profitLoss < 0) type = "loss";
 
-  // update sell entry with profit/loss
+  // Update SELL entry
   await Entry.findByIdAndUpdate(sellId, {
     $set: {
       profitOrLoss: profitLoss,
@@ -32,7 +45,7 @@ async function handleProfitLoss(sellId) {
     },
   });
 
-  // update balance
+  // Update balance (profit adds, loss subtracts)
   let balance = await Balance.findOne();
   if (!balance) balance = await Balance.create({ amount: 0 });
 

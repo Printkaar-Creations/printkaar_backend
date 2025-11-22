@@ -7,12 +7,31 @@ const { body, validationResult } = require("express-validator");
 const handleProfitLoss = require("../helper/handleProfitLoss");
 
 // ------------------ ADD ENTRY ------------------
+async function generateOrderId() {
+  const lastEntry = await Entry.findOne().sort({ createdAt: -1 });
+
+  if (!lastEntry || !lastEntry.orderId) {
+    return "#P000001";
+  }
+
+  const lastNumber = parseInt(lastEntry.orderId.slice(2, 8)); // extract number
+  const newNumber = lastNumber + 1;
+
+  return `#P${String(newNumber).padStart(6, "0")}`;
+}
 
 router.post(
   "/add",
   fetchAdmin,
   [
-    body("type").isIn(["sell", "purchase", "others", "expense", "restMoney"]),
+    body("type").isIn([
+      "sell",
+      "purchase",
+      "others",
+      "expense",
+      "restMoney",
+      "delivery",
+    ]),
     body("totalAmount").isNumeric(),
   ],
   async (req, res) => {
@@ -26,16 +45,16 @@ router.post(
 
       // PURCHASE must be linked
       if (entryData.type === "purchase" && !entryData.linkedSellId) {
-        return res.status(400).json({
-          error: "Purchase must link to a Sell entry.",
-        });
+        return res
+          .status(400)
+          .json({ error: "Purchase must link to a Sell entry." });
       }
 
       // restMoney must be linked
       if (entryData.type === "restMoney" && !entryData.linkedSellId) {
-        return res.status(400).json({
-          error: "restMoney must link to a Sell entry.",
-        });
+        return res
+          .status(400)
+          .json({ error: "restMoney must link to a Sell entry." });
       }
 
       // Validate linked sell
@@ -43,13 +62,78 @@ router.post(
       if (entryData.linkedSellId) {
         relatedSell = await Entry.findById(entryData.linkedSellId);
         if (!relatedSell || relatedSell.type !== "sell") {
-          return res.status(400).json({
-            error: "Invalid linkedSellId: SELL entry not found.",
-          });
+          return res
+            .status(400)
+            .json({ error: "Invalid linkedSellId: SELL entry not found." });
         }
       }
 
-      // -------------------- HANDLE REST MONEY --------------------
+      // ==========================================================
+      // DELIVERY CHARGE (SPECIAL CASE – DO NOT CREATE MAIN ENTRY)
+      // ==========================================================
+      if (entryData.type === "delivery") {
+        const amount = Number(entryData.deliveryAmount);
+
+        if (!amount || amount <= 0) {
+          return res.status(400).json({ error: "Invalid delivery amount" });
+        }
+
+        // CUSTOMER PAYS → 2 ENTRIES
+        if (entryData.deliveryType === "customer") {
+          await Entry.create({
+            type: "delivery",
+            orderId: await generateOrderId(),
+            name: relatedSell?.name,
+            company: relatedSell?.company,
+            totalAmount: amount,
+            linkedSellId: entryData.linkedSellId,
+            createdBy: req.user.id,
+            note: "Delivery Charge (By Customer)",
+            action: "completed",
+          });
+
+          await Entry.create({
+            type: "delivery",
+            orderId: await generateOrderId(),
+            name: relatedSell?.name,
+            company: relatedSell?.company,
+            totalAmount: amount,
+            linkedSellId: entryData.linkedSellId,
+            createdBy: req.user.id,
+            note: "Delivery Charge Paid",
+            action: "completed",
+          });
+        }
+
+        // OWN PAYS → 1 EXPENSE ENTRY
+        if (entryData.deliveryType === "own") {
+          let balance = await Balance.findOne();
+          if (!balance) balance = await Balance.create({ amount: 0 });
+
+          balance.amount -= amount;
+          await balance.save();
+
+          await Entry.create({
+            type: "delivery",
+            orderId: await generateOrderId(),
+            name: relatedSell?.name,
+            company: relatedSell?.company,
+            totalAmount: amount,
+            linkedSellId: entryData.linkedSellId,
+            createdBy: req.user.id,
+            note: "Delivery Charge (Own)",
+            action: "completed",
+          });
+          await handleProfitLoss(entryData.linkedSellId);
+        }
+
+        // STOP EXECUTION → NO MAIN ENTRY CREATION
+        return res.json({ success: true, message: "Delivery charge added" });
+      }
+
+      // ==========================================================
+      // REST MONEY
+      // ==========================================================
       if (entryData.type === "restMoney") {
         const sellEntry = relatedSell;
 
@@ -62,21 +146,18 @@ router.post(
         const newAction =
           advance + updatedRest === total ? "completed" : "processing";
 
-        // Update SELL entry
         await Entry.findByIdAndUpdate(entryData.linkedSellId, {
-          $set: {
-            restMoney: updatedRest,
-            action: newAction,
-          },
+          $set: { restMoney: updatedRest, action: newAction },
         });
 
-        // SELL becomes completed → calculate profit/loss
         if (newAction === "completed") {
           await handleProfitLoss(entryData.linkedSellId);
         }
       }
 
-      // -------------------- HANDLE OTHERS / EXPENSE --------------------
+      // ==========================================================
+      // OTHERS / EXPENSE
+      // ==========================================================
       if (entryData.type === "others" || entryData.type === "expense") {
         let balance = await Balance.findOne();
         if (!balance) balance = await Balance.create({ amount: 0 });
@@ -85,8 +166,10 @@ router.post(
         await balance.save();
       }
 
-      // -------------------- ACTION CALCULATION --------------------
-      let actionStatus = "completed"; // default for all except SELL
+      // ==========================================================
+      // ACTION CALCULATION FOR SELL
+      // ==========================================================
+      let actionStatus = "completed";
 
       if (entryData.type === "sell") {
         const total = Number(entryData.totalAmount || 0);
@@ -96,15 +179,18 @@ router.post(
         actionStatus = advance + rest === total ? "completed" : "processing";
       }
 
-      // CREATE ENTRY
+      // ==========================================================
+      // NORMAL ENTRY CREATION
+      // ==========================================================
       const entry = await Entry.create({
         ...entryData,
+        orderId: await generateOrderId(),
         createdBy: req.user.id,
         action: actionStatus,
         status: "pending",
       });
 
-      res.json({ success: true, entry });
+      return res.json({ success: true, entry });
     } catch (err) {
       console.log(err);
       res.status(500).send("Internal server error");
