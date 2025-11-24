@@ -7,17 +7,51 @@ const { body, validationResult } = require("express-validator");
 const handleProfitLoss = require("../helper/handleProfitLoss");
 
 // ------------------ ADD ENTRY ------------------
-async function generateOrderId() {
-  const lastEntry = await Entry.findOne().sort({ createdAt: -1 });
+async function generateMainOrderId() {
+  // find last entry whose orderId is exactly "#P" + 6 digits
+  const lastMain = await Entry.findOne({
+    orderId: { $regex: /^#P\d{4}$/ },
+  }).sort({ createdAt: -1 });
 
-  if (!lastEntry || !lastEntry.orderId) {
-    return "#P000001";
+  if (!lastMain || !lastMain.orderId) {
+    return "#P0001";
   }
 
-  const lastNumber = parseInt(lastEntry.orderId.slice(2, 8)); // extract number
+  const lastNumber = parseInt(lastMain.orderId.slice(2, 8), 10); // extract 000001
   const newNumber = lastNumber + 1;
 
   return `#P${String(newNumber).padStart(6, "0")}`;
+}
+
+// Child IDs: for a given sell, generate #P000001A, #P000001B, ...
+async function generateChildOrderId(sellId) {
+  const sell = await Entry.findById(sellId);
+  if (!sell || !sell.orderId) {
+    // Fallback: if something is wrong, at least return a new main + A
+    const base = await generateMainOrderId();
+    return base + "A";
+  }
+
+  const base = sell.orderId; // e.g. "#P000001"
+
+  // find all children that already use this base with a letter
+  const children = await Entry.find({
+    linkedSellId: sellId,
+    orderId: { $regex: `^${base}[A-Z]$` },
+  }).select("orderId");
+
+  const usedLetters = new Set(children.map((c) => c.orderId.slice(-1)));
+
+  let code = "A".charCodeAt(0);
+  while (
+    usedLetters.has(String.fromCharCode(code)) &&
+    code <= "Z".charCodeAt(0)
+  ) {
+    code++;
+  }
+
+  const letter = String.fromCharCode(code); // "A", "B", ...
+  return base + letter;
 }
 
 router.post(
@@ -80,9 +114,12 @@ router.post(
 
         // CUSTOMER PAYS → 2 ENTRIES
         if (entryData.deliveryType === "customer") {
+          const orderId1 = await generateChildOrderId(entryData.linkedSellId);
+          const orderId2 = await generateChildOrderId(entryData.linkedSellId);
+
           await Entry.create({
             type: "delivery",
-            orderId: await generateOrderId(),
+            orderId: orderId1,
             name: relatedSell?.name,
             company: relatedSell?.company,
             totalAmount: amount,
@@ -94,7 +131,7 @@ router.post(
 
           await Entry.create({
             type: "delivery",
-            orderId: await generateOrderId(),
+            orderId: orderId2,
             name: relatedSell?.name,
             company: relatedSell?.company,
             totalAmount: amount,
@@ -113,9 +150,13 @@ router.post(
           balance.amount -= amount;
           await balance.save();
 
+          const childOrderId = await generateChildOrderId(
+            entryData.linkedSellId
+          );
+
           await Entry.create({
             type: "delivery",
-            orderId: await generateOrderId(),
+            orderId: childOrderId,
             name: relatedSell?.name,
             company: relatedSell?.company,
             totalAmount: amount,
@@ -186,7 +227,7 @@ router.post(
         await balance.save();
       }
 
-    //   console.log(entryData, "entryData");
+        console.log(entryData, "entryData");
       // ==========================================================
       // PURCHASE → CUT FROM BALANCE
       // ==========================================================
@@ -215,12 +256,27 @@ router.post(
         actionStatus = advance + rest === total ? "completed" : "processing";
       }
 
+      let orderId = null;
+      // Main numbered IDs
+      if (
+        entryData.type === "sell" ||
+        entryData.type === "others" ||
+        entryData.type === "expense"
+      ) {
+        orderId = await generateMainOrderId();
+      }
+
+      // Child IDs under a sell
+      if (entryData.type === "purchase" || entryData.type === "restMoney") {
+        orderId = await generateChildOrderId(entryData.linkedSellId);
+      }
+
       // ==========================================================
       // NORMAL ENTRY CREATION
       // ==========================================================
       const entry = await Entry.create({
         ...entryData,
-        orderId: await generateOrderId(),
+        orderId,
         createdBy: req.user.id,
         action: actionStatus,
         status: "pending",
@@ -264,7 +320,6 @@ router.put("/edit/:id", fetchAdmin, async (req, res) => {
       if (!balance) balance = await Balance.create({ amount: 0 });
 
       const diff = newTotalAmount - oldTotalAmount;
-      // creation subtracted → now subtract diff
       balance.amount -= diff;
       await balance.save();
     }
@@ -274,8 +329,13 @@ router.put("/edit/:id", fetchAdmin, async (req, res) => {
       let balance = await Balance.findOne();
       if (!balance) balance = await Balance.create({ amount: 0 });
 
-      const diff = newTotalAmount - oldTotalAmount;
-      // creation subtracted → now subtract diff
+      const oldTotal =
+        Number(entry.totalAmount || 0) + Number(entry.deliveryCharge || 0);
+      const newTotal =
+        Number(updateData.totalAmount ?? entry.totalAmount ?? 0) +
+        Number(updateData.deliveryCharge ?? entry.deliveryCharge ?? 0);
+
+      const diff = newTotal - oldTotal;
       balance.amount -= diff;
       await balance.save();
     }
@@ -396,12 +456,10 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
       await balance.save();
     }
 
-    // ----------------------------------------------
-    // 2️⃣ DELETE PURCHASE → RESTORE BALANCE
-    // (creation subtracted)
-    // ----------------------------------------------
+    // 2️⃣ PURCHASE → RESTORE BALANCE (total + delivery)
     else if (entry.type === "purchase") {
-      balance.amount += Number(entry.totalAmount || 0);
+      balance.amount +=
+        Number(entry.totalAmount || 0) + Number(entry.deliveryCharge || 0);
       await balance.save();
     }
 
@@ -444,29 +502,21 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
     // 4️⃣ DELETE DELIVERY
     // ----------------------------------------------
     else if (entry.type === "delivery") {
-      // Only 'Delivery Charge (Own)' touches balance
       if (entry.note === "Delivery Charge (Own)") {
         balance.amount += Number(entry.totalAmount || 0); // reverse
         await balance.save();
-
-        // recalc profit for linked sell if exists
         if (entry.linkedSellId) {
           await handleProfitLoss(entry.linkedSellId);
         }
       }
-      // other delivery types → no balance effect
     }
 
-    // ----------------------------------------------
-    // 5️⃣ DELETE SELL → reverse all child effects
-    // ----------------------------------------------
+    // 5️⃣ SELL → reverse all child effects
     else if (entry.type === "sell") {
       const sellId = entry._id;
 
-      // reverse ADVANCE
       balance.amount -= Number(entry.advance || 0);
 
-      // restMoney children (money in)
       const restEntries = await Entry.find({
         linkedSellId: sellId,
         type: "restMoney",
@@ -475,16 +525,15 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
         balance.amount -= Number(r.restMoney || 0);
       });
 
-      // purchase children (money out)
       const purchaseEntries = await Entry.find({
         linkedSellId: sellId,
         type: "purchase",
       });
       purchaseEntries.forEach((p) => {
-        balance.amount += Number(p.totalAmount || 0);
+        balance.amount +=
+          Number(p.totalAmount || 0) + Number(p.deliveryCharge || 0);
       });
 
-      // delivery own children (money out)
       const deliveryOwnEntries = await Entry.find({
         linkedSellId: sellId,
         type: "delivery",
@@ -496,7 +545,6 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
 
       await balance.save();
 
-      // delete all children (purchase, restMoney, delivery)
       await Entry.deleteMany({ linkedSellId: sellId });
     }
 
