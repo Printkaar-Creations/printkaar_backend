@@ -146,10 +146,18 @@ router.post(
         const newAction =
           advance + updatedRest === total ? "completed" : "processing";
 
+        // Update SELL entry
         await Entry.findByIdAndUpdate(entryData.linkedSellId, {
           $set: { restMoney: updatedRest, action: newAction },
         });
 
+        // MONEY IN → Add restMoney to balance
+        let balance = await Balance.findOne();
+        if (!balance) balance = await Balance.create({ amount: 0 });
+        balance.amount += Number(entryData.restMoney || 0);
+        await balance.save();
+
+        // SELL becomes completed → calculate profit/loss
         if (newAction === "completed") {
           await handleProfitLoss(entryData.linkedSellId);
         }
@@ -163,6 +171,34 @@ router.post(
         if (!balance) balance = await Balance.create({ amount: 0 });
 
         balance.amount -= Number(entryData.totalAmount || 0);
+        await balance.save();
+      }
+
+      // ==========================================================
+      // SELL → ADD ADVANCE TO BALANCE
+      // ==========================================================
+      if (entryData.type === "sell") {
+        let balance = await Balance.findOne();
+        if (!balance) balance = await Balance.create({ amount: 0 });
+
+        const advance = Number(entryData.advance || 0);
+        balance.amount += advance;
+        await balance.save();
+      }
+
+    //   console.log(entryData, "entryData");
+      // ==========================================================
+      // PURCHASE → CUT FROM BALANCE
+      // ==========================================================
+      if (entryData.type === "purchase") {
+        let balance = await Balance.findOne();
+        if (!balance) balance = await Balance.create({ amount: 0 });
+
+        const total = Number(entryData.totalAmount || 0);
+        const delivery = Number(entryData.deliveryCharge || 0);
+
+        // Deduct both
+        balance.amount -= total + delivery;
         await balance.save();
       }
 
@@ -189,6 +225,11 @@ router.post(
         action: actionStatus,
         status: "pending",
       });
+
+      // If SELL is already fully paid at creation → compute profit
+      if (entry.type === "sell" && entry.action === "completed") {
+        await handleProfitLoss(entry._id);
+      }
 
       return res.json({ success: true, entry });
     } catch (err) {
@@ -217,26 +258,37 @@ router.put("/edit/:id", fetchAdmin, async (req, res) => {
     let oldTotalAmount = Number(entry.totalAmount || 0);
     let newTotalAmount = Number(updateData.totalAmount || oldTotalAmount);
 
-    // 1️⃣ HANDLE OTHERS / EXPENSE EDIT
+    // 1️⃣ HANDLE OTHERS / EXPENSE EDIT  (adjust balance)
     if (entry.type === "others" || entry.type === "expense") {
       let balance = await Balance.findOne();
       if (!balance) balance = await Balance.create({ amount: 0 });
 
-      // if total changed, adjust balance
       const diff = newTotalAmount - oldTotalAmount;
+      // creation subtracted → now subtract diff
       balance.amount -= diff;
       await balance.save();
     }
 
-    // 2️⃣ HANDLE restMoney EDIT (must update SELL entry)
+    // 2️⃣ HANDLE PURCHASE EDIT (adjust balance)
+    if (entry.type === "purchase") {
+      let balance = await Balance.findOne();
+      if (!balance) balance = await Balance.create({ amount: 0 });
+
+      const diff = newTotalAmount - oldTotalAmount;
+      // creation subtracted → now subtract diff
+      balance.amount -= diff;
+      await balance.save();
+    }
+
+    // 3️⃣ HANDLE restMoney EDIT (must update SELL + balance)
     if (entry.type === "restMoney") {
       const sellEntry = await Entry.findById(entry.linkedSellId);
 
       const oldRestMoney = Number(entry.restMoney || 0);
       const newRestMoney = Number(updateData.restMoney || oldRestMoney);
-
       const diff = newRestMoney - oldRestMoney;
 
+      // update SELL.restMoney
       const updatedRest = Number(sellEntry.restMoney || 0) + diff;
 
       const advance = Number(sellEntry.advance || 0);
@@ -252,43 +304,53 @@ router.put("/edit/:id", fetchAdmin, async (req, res) => {
         },
       });
 
-      // IF SELL BECAME COMPLETED → PROFIT/LOSS
+      // adjust BALANCE (rest money = money in)
+      let balance = await Balance.findOne();
+      if (!balance) balance = await Balance.create({ amount: 0 });
+      balance.amount += diff;
+      await balance.save();
+
+      // PROFIT if completed
       if (newAction === "completed") {
         await handleProfitLoss(entry.linkedSellId);
+      } else {
+        // if becomes processing → no profit
+        await Entry.findByIdAndUpdate(entry.linkedSellId, {
+          $set: { profitOrLoss: 0, profitType: "neutral" },
+        });
       }
     }
 
-    // 3️⃣ HANDLE SELL EDIT (recalculate action + profit/loss)
+    // 4️⃣ HANDLE SELL EDIT (advance change + profit)
     if (entry.type === "sell") {
       const total = Number(updateData.totalAmount ?? entry.totalAmount ?? 0);
-      const advance = Number(updateData.advance ?? entry.advance ?? 0);
+      const newAdvance = Number(updateData.advance ?? entry.advance ?? 0);
       const rest = Number(entry.restMoney ?? 0);
 
-      const newAction = advance + rest === total ? "completed" : "processing";
+      // Adjust BALANCE for advance diff
+      const oldAdvance = Number(entry.advance || 0);
+      const diffAdvance = newAdvance - oldAdvance;
 
-      updateData.action = newAction;
-
-      // SELL just changed to completed
-      if (entry.action !== "completed" && newAction === "completed") {
-        await handleProfitLoss(entry._id);
-      }
-
-      // SELL changed from completed → processing
-      if (entry.action === "completed" && newAction === "processing") {
-        // REVERSE previous profit/loss
+      if (diffAdvance !== 0) {
         let balance = await Balance.findOne();
         if (!balance) balance = await Balance.create({ amount: 0 });
-
-        balance.amount -= Number(entry.profitOrLoss || 0);
+        balance.amount += diffAdvance; // creation added → adjust
         await balance.save();
+      }
 
-        // reset profit
+      const newAction =
+        newAdvance + rest === total ? "completed" : "processing";
+      updateData.action = newAction;
+
+      if (newAction === "completed") {
+        await handleProfitLoss(entry._id);
+      } else {
         updateData.profitOrLoss = 0;
         updateData.profitType = "neutral";
       }
     }
 
-    // update status
+    // reset status after edit
     updateData.status = "pending";
 
     const updatedEntry = await Entry.findByIdAndUpdate(
@@ -335,9 +397,18 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
     }
 
     // ----------------------------------------------
-    // 2️⃣ DELETE restMoney entry → reverse SELL updates
+    // 2️⃣ DELETE PURCHASE → RESTORE BALANCE
+    // (creation subtracted)
     // ----------------------------------------------
-    if (entry.type === "restMoney") {
+    else if (entry.type === "purchase") {
+      balance.amount += Number(entry.totalAmount || 0);
+      await balance.save();
+    }
+
+    // ----------------------------------------------
+    // 3️⃣ DELETE restMoney → reverse SELL + BALANCE
+    // ----------------------------------------------
+    else if (entry.type === "restMoney") {
       const sell = await Entry.findById(entry.linkedSellId);
       if (sell) {
         const newRest =
@@ -353,41 +424,83 @@ router.delete("/delete/:id", fetchAdmin, async (req, res) => {
           $set: {
             restMoney: newRest,
             action: newAction,
+            ...(newAction === "completed"
+              ? {}
+              : { profitOrLoss: 0, profitType: "neutral" }),
           },
         });
 
-        // reverse profit/loss if sell loses completion
-        if (sell.action === "completed" && newAction === "processing") {
-          balance.amount -= Number(sell.profitOrLoss || 0);
-          await balance.save();
-
-          await Entry.findByIdAndUpdate(sell._id, {
-            $set: { profitOrLoss: 0, profitType: "neutral" },
-          });
+        if (newAction === "completed") {
+          await handleProfitLoss(sell._id);
         }
       }
+
+      // BALANCE: restMoney is money in → remove it on delete
+      balance.amount -= Number(entry.restMoney || 0);
+      await balance.save();
     }
 
     // ----------------------------------------------
-    // 3️⃣ DELETE SELL → cascade delete all children
+    // 4️⃣ DELETE DELIVERY
     // ----------------------------------------------
-    if (entry.type === "sell") {
-      // reverse profit/loss if completed
-      if (entry.action === "completed") {
-        balance.amount -= Number(entry.profitOrLoss || 0);
+    else if (entry.type === "delivery") {
+      // Only 'Delivery Charge (Own)' touches balance
+      if (entry.note === "Delivery Charge (Own)") {
+        balance.amount += Number(entry.totalAmount || 0); // reverse
         await balance.save();
+
+        // recalc profit for linked sell if exists
+        if (entry.linkedSellId) {
+          await handleProfitLoss(entry.linkedSellId);
+        }
       }
-
-      // delete purchases linked to this sell
-      await Entry.deleteMany({ linkedSellId: entry._id, type: "purchase" });
-
-      // delete restMoney linked to this sell
-      await Entry.deleteMany({ linkedSellId: entry._id, type: "restMoney" });
+      // other delivery types → no balance effect
     }
 
     // ----------------------------------------------
-    // 4️⃣ FINALLY DELETE ENTRY ITSELF
+    // 5️⃣ DELETE SELL → reverse all child effects
     // ----------------------------------------------
+    else if (entry.type === "sell") {
+      const sellId = entry._id;
+
+      // reverse ADVANCE
+      balance.amount -= Number(entry.advance || 0);
+
+      // restMoney children (money in)
+      const restEntries = await Entry.find({
+        linkedSellId: sellId,
+        type: "restMoney",
+      });
+      restEntries.forEach((r) => {
+        balance.amount -= Number(r.restMoney || 0);
+      });
+
+      // purchase children (money out)
+      const purchaseEntries = await Entry.find({
+        linkedSellId: sellId,
+        type: "purchase",
+      });
+      purchaseEntries.forEach((p) => {
+        balance.amount += Number(p.totalAmount || 0);
+      });
+
+      // delivery own children (money out)
+      const deliveryOwnEntries = await Entry.find({
+        linkedSellId: sellId,
+        type: "delivery",
+        note: "Delivery Charge (Own)",
+      });
+      deliveryOwnEntries.forEach((d) => {
+        balance.amount += Number(d.totalAmount || 0);
+      });
+
+      await balance.save();
+
+      // delete all children (purchase, restMoney, delivery)
+      await Entry.deleteMany({ linkedSellId: sellId });
+    }
+
+    // finally delete entry itself
     await Entry.findByIdAndDelete(req.params.id);
 
     res.json({
@@ -465,59 +578,74 @@ router.get("/balance", fetchAdmin, async (req, res) => {
 // ------------------ DASHBOARD STATS ------------------
 router.get("/stats", fetchAdmin, async (req, res) => {
   try {
+    // -------------------- TODAY RANGE --------------------
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
     const todayEnd = new Date();
     todayEnd.setHours(23, 59, 59, 999);
 
+    // -------------------- THIS MONTH RANGE --------------------
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+
+    const monthEnd = new Date(); // now
+
     // Fetch all entries
     const entries = await Entry.find();
 
-    // Fetch today entries
+    // Today's entries only
     const todayEntries = await Entry.find({
       createdAt: { $gte: todayStart, $lte: todayEnd },
     });
 
-    // Sale Total
+    // This Month entries only
+    const monthEntries = await Entry.find({
+      createdAt: { $gte: monthStart, $lte: monthEnd },
+    });
+
+    // -------------------- TOTAL STATS --------------------
     const saleTotal = entries
       .filter((e) => e.type === "sell")
       .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
 
-    // Purchase Total
+    // Purchase Total + Delivery Charge Included
     const purchaseTotal = entries
       .filter((e) => e.type === "purchase")
-      .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
-
-    // Others Total
+      .reduce(
+        (sum, e) =>
+          sum + Number(e.totalAmount || 0) + Number(e.deliveryCharge || 0), // <---- ADD THIS
+        0
+      );
     const othersTotal = entries
       .filter((e) => e.type === "others")
       .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
 
-    // Expenses Total
     const expenseTotal = entries
       .filter((e) => e.type === "expense")
       .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
 
-    // Profit Total
     const profitTotal = entries
       .filter((e) => e.profitType === "profit")
       .reduce((sum, e) => sum + Number(e.profitOrLoss || 0), 0);
 
-    // Loss Total
     const lossTotal = entries
       .filter((e) => e.profitType === "loss")
       .reduce((sum, e) => sum + Number(e.profitOrLoss || 0), 0);
 
-    // Today Stats
+    // -------------------- TODAY STATS --------------------
     const todaySale = todayEntries
       .filter((e) => e.type === "sell")
       .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
 
     const todayPurchase = todayEntries
       .filter((e) => e.type === "purchase")
-      .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
-
+      .reduce(
+        (sum, e) =>
+          sum + Number(e.totalAmount || 0) + Number(e.deliveryCharge || 0), // <---- ADD THIS
+        0
+      );
     const todayExpense = todayEntries
       .filter((e) => e.type === "expense")
       .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
@@ -534,7 +662,35 @@ router.get("/stats", fetchAdmin, async (req, res) => {
       .filter((e) => e.profitType === "loss")
       .reduce((sum, e) => sum + Number(e.profitOrLoss || 0), 0);
 
-    // Balance
+    // -------------------- THIS MONTH STATS --------------------
+    const monthSale = monthEntries
+      .filter((e) => e.type === "sell")
+      .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
+
+    const monthPurchase = monthEntries
+      .filter((e) => e.type === "purchase")
+      .reduce(
+        (sum, e) =>
+          sum + Number(e.totalAmount || 0) + Number(e.deliveryCharge || 0), // <---- ADD THIS
+        0
+      );
+    const monthExpense = monthEntries
+      .filter((e) => e.type === "expense")
+      .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
+
+    const monthOthers = monthEntries
+      .filter((e) => e.type === "others")
+      .reduce((sum, e) => sum + Number(e.totalAmount || 0), 0);
+
+    const monthProfit = monthEntries
+      .filter((e) => e.profitType === "profit")
+      .reduce((sum, e) => sum + Number(e.profitOrLoss || 0), 0);
+
+    const monthLoss = monthEntries
+      .filter((e) => e.profitType === "loss")
+      .reduce((sum, e) => sum + Number(e.profitOrLoss || 0), 0);
+
+    // BALANCE
     let balance = await Balance.findOne();
     if (!balance) balance = await Balance.create({ amount: 0 });
 
@@ -556,6 +712,14 @@ router.get("/stats", fetchAdmin, async (req, res) => {
         todayOthers,
         todayProfit,
         todayLoss,
+      },
+      month: {
+        monthSale,
+        monthPurchase,
+        monthExpense,
+        monthOthers,
+        monthProfit,
+        monthLoss,
       },
     });
   } catch (err) {
